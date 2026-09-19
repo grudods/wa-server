@@ -36,6 +36,8 @@ const SENHA_SERVIDOR = process.env.FIREBASE_SENHA || '';
 let token = null;
 let tokenExpiraEm = 0;
 
+let proximaTentativa = 0;
+
 async function pegarToken() {
   // Sem credenciais configuradas, trabalha sem login
   // (funciona so enquanto as regras estiverem abertas).
@@ -43,31 +45,53 @@ async function pegarToken() {
 
   if (token && Date.now() < tokenExpiraEm) return token;
 
-  const r = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email: EMAIL_SERVIDOR,
-        password: SENHA_SERVIDOR,
-        returnSecureToken: true
-      })
+  // Se o login acabou de falhar, espera um pouco antes de tentar de novo.
+  // Evita ficar martelando o Google e tomar bloqueio temporario.
+  if (Date.now() < proximaTentativa) return null;
+
+  try {
+    const r = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: EMAIL_SERVIDOR,
+          password: SENHA_SERVIDOR,
+          returnSecureToken: true
+        })
+      }
+    );
+
+    const dados = await r.json();
+
+    if (!r.ok) {
+      const erro = dados?.error?.message || 'erro desconhecido';
+      console.error(`❌ LOGIN NO FIREBASE FALHOU: ${erro}`);
+      if (erro.includes('INVALID_LOGIN') || erro.includes('INVALID_PASSWORD')) {
+        console.error('   -> Confira FIREBASE_EMAIL e FIREBASE_SENHA no Render.');
+      }
+      if (erro.includes('EMAIL_NOT_FOUND')) {
+        console.error('   -> Essa conta nao existe no Authentication do Firebase.');
+      }
+      if (erro.includes('API key not valid')) {
+        console.error('   -> Confira FIREBASE_API_KEY no Render.');
+      }
+      proximaTentativa = Date.now() + 60000; // so tenta de novo em 1 minuto
+      return null;
     }
-  );
 
-  const dados = await r.json();
-
-  if (!r.ok) {
-    console.error('Login no Firebase falhou:', dados?.error?.message);
+    token = dados.idToken;
+    // o token vale 1 hora; renovamos 5 minutos antes
+    tokenExpiraEm = Date.now() + (Number(dados.expiresIn || 3600) - 300) * 1000;
+    proximaTentativa = 0;
+    console.log('🔑 Servidor autenticado no Firebase');
+    return token;
+  } catch (e) {
+    console.error('Erro de rede ao logar no Firebase:', e.message);
+    proximaTentativa = Date.now() + 30000;
     return null;
   }
-
-  token = dados.idToken;
-  // o token vale 1 hora; renovamos 5 minutos antes
-  tokenExpiraEm = Date.now() + (Number(dados.expiresIn || 3600) - 300) * 1000;
-  console.log('🔑 Servidor autenticado no Firebase');
-  return token;
 }
 
 // ---------- FIREBASE (REST) ----------
@@ -172,8 +196,25 @@ async function verificarPendentes() {
 
 // ---------- WHATSAPP ----------
 
+let conectando = false;
+
 async function conectar() {
-  const { state, saveCreds } = await useFirebaseAuthState(DB, 'principal', pegarToken);
+  if (conectando) return;      // ja tem uma conexao sendo feita
+  conectando = true;
+
+  let state, saveCreds;
+  try {
+    ({ state, saveCreds } = await useFirebaseAuthState(DB, 'principal', pegarToken));
+  } catch (e) {
+    // Nao conseguiu ler a sessao. NAO cria sessao nova por conta disso:
+    // seria perder a conexao do WhatsApp por causa de uma falha passageira.
+    console.error('⚠️  Nao foi possivel carregar a sessao:', e.message);
+    console.error('    Tentando de novo em 15 segundos...');
+    conectando = false;
+    setTimeout(conectar, 15000);
+    return;
+  }
+
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
@@ -184,6 +225,7 @@ async function conectar() {
     syncFullHistory: false
   });
 
+  conectando = false;
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (u) => {
@@ -204,6 +246,7 @@ async function conectar() {
 
     if (connection === 'close') {
       conectado = false;
+      conectando = false;
       const motivo = lastDisconnect?.error?.output?.statusCode;
       const deslogado = motivo === DisconnectReason.loggedOut;
 
@@ -303,8 +346,18 @@ app.get('/status', (req, res) => {
   res.json({ conectado, numero: numeroConectado, aguardandoQr: !!qrAtual });
 });
 
-app.listen(PORTA, () => {
+app.listen(PORTA, async () => {
   console.log(`Servidor na porta ${PORTA}`);
+
+  // Testa o login logo de cara, para o erro (se houver) sair no comeco do log
+  if (API_KEY && EMAIL_SERVIDOR && SENHA_SERVIDOR) {
+    const t = await pegarToken();
+    if (!t) console.error('⚠️  Servidor SEM login no Firebase. So funciona com as regras abertas.');
+  } else {
+    console.log('ℹ️  Sem credenciais do Firebase (FIREBASE_API_KEY / EMAIL / SENHA).');
+    console.log('   Funciona enquanto as regras do banco estiverem abertas.');
+  }
+
   conectar().catch(e => console.error('Erro ao conectar:', e));
   setInterval(verificarPendentes, INTERVALO_ENVIO);
 

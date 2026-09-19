@@ -15,17 +15,35 @@ async function useFirebaseAuthState(databaseURL, sessaoId = 'principal', pegarTo
     return `${base}/${caminho}.json${t ? `?auth=${t}` : ''}`;
   };
 
-  const ler = async (caminho) => {
-    try {
-      const r = await fetch(await url(caminho));
-      if (!r.ok) return null;
-      const bruto = await r.json();
-      if (!bruto) return null;
-      return JSON.parse(bruto, BufferJSON.reviver);
-    } catch (e) {
-      console.error('Erro ao ler sessao:', e.message);
-      return null;
+  // Le um item da sessao.
+  // Diferenca importante:
+  //   - devolve null quando o item simplesmente nao existe
+  //   - joga erro quando a leitura FALHOU (rede, permissao)
+  // Sem isso, uma falha passageira apagaria a sessao e pediria QR de novo.
+  const ler = async (caminho, tentativas = 3) => {
+    let ultimoErro = null;
+
+    for (let i = 0; i < tentativas; i++) {
+      try {
+        const r = await fetch(await url(caminho));
+
+        if (r.status === 401 || r.status === 403) {
+          throw new Error('sem permissao no Firebase (confira o login do servidor)');
+        }
+        if (!r.ok) {
+          throw new Error(`HTTP ${r.status}`);
+        }
+
+        const bruto = await r.json();
+        if (!bruto) return null;               // nao existe = sessao nova
+        return JSON.parse(bruto, BufferJSON.reviver);
+      } catch (e) {
+        ultimoErro = e;
+        if (i < tentativas - 1) await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+      }
     }
+
+    throw new Error(`Falha ao ler sessao (${caminho}): ${ultimoErro.message}`);
   };
 
   const gravar = async (caminho, dados) => {
@@ -49,7 +67,16 @@ async function useFirebaseAuthState(databaseURL, sessaoId = 'principal', pegarTo
     }
   };
 
-  const creds = (await ler('creds')) || initAuthCreds();
+  let creds;
+  const salvas = await ler('creds');   // se falhar, estoura de proposito
+
+  if (salvas) {
+    creds = salvas;
+    console.log('💾 Sessao recuperada do Firebase (nao precisa ler QR)');
+  } else {
+    creds = initAuthCreds();
+    console.log('🆕 Nenhuma sessao salva. Vai gerar QR Code.');
+  }
 
   return {
     state: {
